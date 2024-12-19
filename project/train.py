@@ -155,9 +155,10 @@ class DINOv2Trainer(Trainer):
             'teacher_temp': teacher_temp,
         })
 
+        self.log(log_params)
+
         inputs['teacher_temp'] = teacher_temp
 
-        self.log(log_params)
         
         ret = super(DINOv2Trainer, self).training_step(
             model=model,
@@ -186,6 +187,9 @@ def main():
         embed_dim=384,
         num_heads=6,
         batch_size=4096,
+        base_lr=0.002,
+        lr_warmup_percentile=float(10 / 300),
+        teacher_temp_warmup_percentile=float(30 / 300),
     )
     model = DINOv2(config)
     
@@ -227,13 +231,13 @@ def main():
     training_args = TrainingArguments(
         output_dir='million-aid/model',
         logging_dir='million-aid/logs',
-        logging_steps=1,
+        logging_steps=5,
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=1,
         save_strategy='epoch',
         report_to='tensorboard',
         do_train=True,
-        num_train_epochs=200,
+        num_train_epochs=300,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={
             'use_reentrant': False,
@@ -250,7 +254,6 @@ def main():
         args=training_args,
         train_dataset=dataset,
         data_collator=collate_fn,
-        # callbacks=[DINOv2TrainerState()],
     )
 
     trainer.train()
