@@ -167,7 +167,7 @@ def main():
     )
     model = DINOv2(config)
     
-    filenames = read_filename('/nas/k8s/dev/mlops/chagmgang/msf24b/Million-AID.txt')
+    filenames = read_filename('Million-AID.txt')
     
     image_size = config.img_size
     patch_size = config.patch_size
