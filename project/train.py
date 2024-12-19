@@ -9,9 +9,11 @@ import torch.nn as nn
 import numpy as np
 from transformers import TrainingArguments
 from transformers import Trainer
+from transformers import TrainerCallback
 
 from dinov2.models import DINOv2, DINOv2Config
 from dinov2.data import MaskingGenerator, DINOAugmentation, BaseDataset, collate_data_and_cast
+
 
 
 class CosineScheduler(object):
@@ -136,7 +138,27 @@ class DINOv2Trainer(Trainer):
             param_group["weight_decay"] = wd * wd_multiplier
             param_group["lr"] = (last_layer_lr if is_last_layer else lr) * lr_multiplier
 
+        log_params = dict()
+
+        for param_group in self.optimizer.param_groups:
+            if 'patch_embed' in param_group['name']:
+                log_param = dict()
+                name = param_group['name']
+                for key in ['weight_decay', 'lr']:
+                    log_param[f'{name}_{key}'] = param_group[key]
+                log_params.update(log_param)
+
+        log_params.update({
+            'lr': lr,
+            'wd': wd,
+            'momentum': mom,
+            'teacher_temp': teacher_temp,
+        })
+
         inputs['teacher_temp'] = teacher_temp
+
+        self.log(log_params)
+        
         ret = super(DINOv2Trainer, self).training_step(
             model=model,
             inputs=inputs,
@@ -163,11 +185,11 @@ def main():
     config = DINOv2Config(
         embed_dim=384,
         num_heads=6,
-        batch_size=1024,
+        batch_size=4096,
     )
     model = DINOv2(config)
     
-    filenames = read_filename('Million-AID.txt')
+    filenames = read_filename('/nas/k8s/dev/mlops/chagmgang/msf24b/Million-AID.txt')
     
     image_size = config.img_size
     patch_size = config.patch_size
@@ -211,7 +233,7 @@ def main():
         save_strategy='epoch',
         report_to='tensorboard',
         do_train=True,
-        num_train_epochs=100,
+        num_train_epochs=200,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={
             'use_reentrant': False,
@@ -228,6 +250,7 @@ def main():
         args=training_args,
         train_dataset=dataset,
         data_collator=collate_fn,
+        # callbacks=[DINOv2TrainerState()],
     )
 
     trainer.train()
