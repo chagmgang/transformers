@@ -11,7 +11,7 @@ from transformers import TrainingArguments
 from transformers import Trainer
 from transformers import TrainerCallback
 
-from dinov2.models import DINOv2, DINOv2Config
+from dinov2.models import DINOv1, DINOv2Config
 from dinov2.data import MaskingGenerator, DINOAugmentation, BaseDataset, collate_data_and_cast
 
 
@@ -188,12 +188,22 @@ def main():
         num_heads=6,
         batch_size=4096,
         base_lr=0.002,
-        lr_warmup_percentile=float(10 / 300),
-        teacher_temp_warmup_percentile=float(30 / 300),
+        lr_warmup_percentile=float(10 / 100),
+        teacher_temp_warmup_percentile=float(30 / 100),
     )
-    model = DINOv2(config)
-    
-    filenames = read_filename('/nas/k8s/dev/mlops/chagmgang/msf24b/Million-AID.txt')
+    model = DINOv1(config)
+
+    filenames = list()
+    for filename in [
+        '/nas/k8s/dev/mlops/chagmgang/msf24b/Million-AID.txt',
+        # '/nas/k8s/dev/mlops/chagmgang/msf24b/SkyScript_images2.txt',
+        # '/nas/k8s/dev/mlops/chagmgang/msf24b/SkyScript_images3.txt',
+        # '/nas/k8s/dev/mlops/chagmgang/msf24b/SkyScript_images4.txt',
+        # '/nas/k8s/dev/mlops/chagmgang/msf24b/SkyScript_images5.txt',
+        # '/nas/k8s/dev/mlops/chagmgang/msf24b/SkyScript_images6.txt',
+        # '/nas/k8s/dev/mlops/chagmgang/msf24b/SkyScript_images7.txt',
+    ]:
+        filenames.extend(read_filename(filename))
     
     image_size = config.img_size
     patch_size = config.patch_size
@@ -229,15 +239,15 @@ def main():
     per_device_train_batch_size = int(batch_size / int(os.environ['WORLD_SIZE']))
 
     training_args = TrainingArguments(
-        output_dir='million-aid/model',
-        logging_dir='million-aid/logs',
+        output_dir='integration/model',
+        logging_dir='integration/logs',
         logging_steps=5,
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=1,
         save_strategy='epoch',
         report_to='tensorboard',
         do_train=True,
-        num_train_epochs=300,
+        num_train_epochs=100,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={
             'use_reentrant': False,

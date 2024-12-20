@@ -625,7 +625,7 @@ class KoLeoLoss(nn.Module):
         return loss
 
         
-class DINOv2(ViTPretrainedModel):
+class DINOv1(ViTPretrainedModel):
 
     def __init__(self, config):
         super().__init__(config)

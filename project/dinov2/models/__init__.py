@@ -1,1 +1,1 @@
-from .dinov2 import DINOv2Config, DINOv2
+from .dinov2 import DINOv2Config, DINOv1
