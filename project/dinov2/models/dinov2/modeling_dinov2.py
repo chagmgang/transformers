@@ -445,6 +445,7 @@ class ViT(ViTPretrainedModel):
         self.blocks = nn.ModuleList(blocks_list)
         self.norm = norm_layer(config.embed_dim)
         self.head = nn.Identity()
+        self.mask_token = nn.Parameter(torch.zeros(1, config.embed_dim))
         
         self.init_weights()
         
