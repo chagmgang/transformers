@@ -530,6 +530,49 @@ class ViT(ViTPretrainedModel):
             x_prenorm=x,
         )
 
+    def prepare_tokens_with_masks(self, x, masks):
+        B, nc, h, w = x.shape
+        x = self.patch_embed(x)
+        x = torch.where(
+            masks.unsqueeze(-1),
+            self.mask_token.to(x.dtype).unsqueeze(0),
+            x,
+        )
+        x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
+        x = x + self.interpolate_pos_encoding(x, h, w)
+
+        if self.register_tokens is not None:
+            x = torch.cat(
+                (
+                    x[:, :1],
+                    self.register_tokens.expand(x.shape[0], -1, -1),
+                    x[:, 1:],
+                ),
+                dim=1,
+            )
+        return x
+                          
+    def forward_mask(self, x, masks):
+        
+        x = self.prepare_tokens_with_masks(x, masks)
+
+        for idx, blk in enumerate(self.blocks):
+            if self.gradient_checkpointing and self.training:
+                x = self._gradient_checkpointing_func(
+                    blk,
+                    x,
+                )
+            else:
+                x = blk(x)
+
+        x_norm = self.norm(x)
+        return ViTModelOutput(
+            x_norm_clstoken=x_norm[:, 0],
+            x_norm_regtokens=x_norm[:, 1 : self.num_register_tokens + 1],
+            x_norm_patchtokens=x_norm[:, self.num_register_tokens + 1:],
+            x_prenorm=x,
+        )
+
 
 class DINOLoss(nn.Module):
 
@@ -623,6 +666,81 @@ class KoLeoLoss(nn.Module):
             distances = self.pdist(student_output, student_output[I])  # BxD, BxD -> B
             loss = -torch.log(distances + eps).mean()
         return loss
+
+
+class iBOTPatchLoss(nn.Module):
+
+    def __init__(
+        self,
+        patch_out_dim,
+        student_temp=0.1,
+        center_momentum=0.9,
+    ):
+        super().__init__()
+
+        self.student_temp = student_temp
+
+    @torch.no_grad()
+    def sinkhorn_knopp_teacher(
+        self, 
+        teacher_output, 
+        teacher_temp, 
+        n_masked_patches_tensor, 
+        n_iterations=3
+    ):
+        teacher_output = teacher_output.float()
+        Q = torch.exp(teacher_output / teacher_temp).t()
+        B = n_masked_patches_tensor
+        if dist.is_initialized():
+            dist.all_reduce(B)
+        K = Q.shape[0]  # how many prototypes
+
+        # make the matrix sums to 1
+        sum_Q = torch.sum(Q)
+        if dist.is_initialized():
+            dist.all_reduce(sum_Q)
+        Q /= sum_Q
+
+        for it in range(n_iterations):
+            # normalize each row: total weight per prototype must be 1/K
+            sum_of_rows = torch.sum(Q, dim=1, keepdim=True)
+            if dist.is_initialized():
+                dist.all_reduce(sum_of_rows)
+            Q /= sum_of_rows
+            Q /= K
+
+            # normalize each column: total weight per sample must be 1/B
+            Q /= torch.sum(Q, dim=0, keepdim=True)
+            Q /= B
+
+        Q *= B  # the columns must sum to 1 so that Q is an assignment
+        return Q.t()
+
+    def forward_masked(
+        self,
+        student_patch_tokens_masked,
+        teacher_patch_tokens_masked,
+        student_masks_flat,
+        n_masked_patches=None,
+        masks_weight=None,
+    ):
+        def lossfunc(t, s, temp):
+            return torch.sum(t * F.log_softmax(s / temp, dim=-1), dim=-1)
+        
+        t = teacher_patch_tokens_masked
+        s = student_patch_tokens_masked
+        # loss = torch.sum(t * F.log_softmax(s / self.student_temp, dim=-1), dim=-1)
+        loss = lossfunc(t, s, self.student_temp)
+        if masks_weight is None:
+            masks_weight = (
+                (1 / student_masks_flat.sum(-1).clamp(min=1.0))
+                .unsqueeze(-1)
+                .expand_as(student_masks_flat)[student_masks_flat]
+            )
+        if n_masked_patches is not None:
+            loss = loss[:n_masked_patches]
+        loss = loss * masks_weight
+        return -loss.sum() / student_masks_flat.shape[0]
 
         
 class DINOv1(ViTPretrainedModel):
@@ -749,6 +867,239 @@ class DINOv1(ViTPretrainedModel):
             teacher_cls_tokens_after_head, teacher_temp=teacher_temp,
         ).view(n_global_crops_teacher, -1, *teacher_cls_tokens_after_head.shape[1:])
 
+        return teacher_dino_softmaxed_centered_list, masked_teacher_ibot_softmaxed_centered
+
+    def get_params_groups(self):
+        all_params_groups = []
+        for m in self.student.values():
+            all_params_groups += get_params_groups_with_decay(
+                model=m,
+                lr_decay_rate=self.config.layerwise_decay,
+                patch_embed_lr_mult=self.config.patch_embed_lr_mult,
+            )
+        return all_params_groups
+
+        
+class DINOv2(ViTPretrainedModel):
+
+    def __init__(self, config):
+        super().__init__(config)
+
+        student_model_dict = dict()
+        teacher_model_dict = dict()
+
+        student_backbone = ViT(config)
+        teacher_backbone = ViT(config)
+
+        student_model_dict['backbone'] = student_backbone
+        teacher_model_dict['backbone'] = teacher_backbone
+
+        self.embed_dim = config.embed_dim
+        self.dino_out_dim = config.dino_head_n_prototypes
+
+        student_dino_head = DINOHead(
+            in_dim=config.embed_dim,
+            out_dim=config.dino_head_n_prototypes,
+            hidden_dim=config.head_hidden_dim,
+            bottleneck_dim=config.head_bottleneck_dim,
+            nlayers=config.head_nlayers,
+        )
+        teacher_dino_head = DINOHead(
+            in_dim=config.embed_dim,
+            out_dim=config.dino_head_n_prototypes,
+            hidden_dim=config.head_hidden_dim,
+            bottleneck_dim=config.head_bottleneck_dim,
+            nlayers=config.head_nlayers,
+        )
+        student_ibot_head = DINOHead(
+            in_dim=config.embed_dim,
+            out_dim=config.dino_head_n_prototypes,
+            hidden_dim=config.head_hidden_dim,
+            bottleneck_dim=config.head_bottleneck_dim,
+            nlayers=config.head_nlayers,
+        )
+        teacher_ibot_head = DINOHead(
+            in_dim=config.embed_dim,
+            out_dim=config.dino_head_n_prototypes,
+            hidden_dim=config.head_hidden_dim,
+            bottleneck_dim=config.head_bottleneck_dim,
+            nlayers=config.head_nlayers,
+        )
+
+        student_model_dict["dino_head"] = student_dino_head
+        student_model_dict["ibot_head"] = student_ibot_head
+        teacher_model_dict["dino_head"] = teacher_dino_head
+        teacher_model_dict["ibot_head"] = teacher_ibot_head
+
+        self.student = nn.ModuleDict(student_model_dict)
+        self.teacher = nn.ModuleDict(teacher_model_dict)
+
+        for param_src, param_dst in zip(self.student.parameters(),
+                                        self.teacher.parameters()):
+            param_dst.data.copy_(param_src.data)
+            param_dst.requires_grad = False
+
+        self.dino_loss = DINOLoss(
+            out_dim=config.dino_head_n_prototypes,
+            student_temp=config.student_temp,
+            center_momentum=config.center_momentum,
+        )
+        self.ibot_patch_loss = iBOTPatchLoss(
+            patch_out_dim=config.dino_head_n_prototypes,
+            student_temp=config.student_temp,
+            center_momentum=config.center_momentum,
+        )
+        self.koleo_loss = KoLeoLoss()
+
+    def forward(
+        self, 
+        collated_global_crops, 
+        collated_local_crops, 
+        collated_masks,
+        mask_indices_list,
+        n_masked_patches,
+        upperbound, 
+        masks_weight,
+        teacher_temp, 
+        **kwargs
+    ):
+        n_global_crops = 2
+        n_local_crops = self.config.local_crops_number
+        assert n_global_crops == 2
+
+        global_crops = collated_global_crops.cuda(non_blocking=True)
+        local_crops = collated_local_crops.cuda(non_blocking=True)
+
+        masks = collated_masks.cuda(non_blocking=True)
+        mask_indices_list = mask_indices_list.cuda(non_blocking=True)
+        n_masked_patches_tensor = n_masked_patches.cuda(non_blocking=True)
+        n_masked_patches = mask_indices_list.shape[0]
+        masks_weight = masks_weight.cuda(non_blocking=True)
+
+        n_local_crops_loss_terms = max(n_local_crops * n_global_crops, 1)
+        n_global_crops_loss_terms = (n_global_crops - 1) * n_global_crops
+
+        ibot_loss_scale = 1.0 / n_global_crops
+
+        teacher_dino_softmaxed_centered_list, masked_teacher_ibot_softmaxed_centered = self.get_teacher_output(
+            global_crops, 
+            n_global_crops,
+            upperbound,
+            mask_indices_list,
+            n_masked_patches,
+            n_masked_patches_tensor,
+            teacher_temp,
+        )
+
+        loss_dict = {}
+        student_global_backbone_output_dict = self.student.backbone.forward_mask(
+            global_crops,
+            masks,
+        )
+        student_local_backbone_output_dict = self.student.backbone(
+            local_crops,
+        )
+
+        # do ibot
+        _dim = student_global_backbone_output_dict.x_norm_clstoken.shape[-1]
+        ibot_student_patch_tokens = student_global_backbone_output_dict.x_norm_patchtokens
+        buffer_tensor_patch_tokens = ibot_student_patch_tokens.new_zeros(upperbound, _dim)
+        buffer_tensor_patch_tokens[:n_masked_patches].copy_(
+            torch.index_select(
+                ibot_student_patch_tokens.flatten(0, 1),
+                dim=0,
+                index=mask_indices_list,
+            ),
+        )
+        student_global_masked_patch_tokens_after_head = self.student.ibot_head(
+            buffer_tensor_patch_tokens,
+        )[:n_masked_patches]
+
+        student_global_cls_tokens = student_global_backbone_output_dict.x_norm_clstoken
+        student_local_cls_tokens = student_local_backbone_output_dict.x_norm_clstoken
+        student_global_cls_tokens_after_head = self.student.dino_head(student_global_cls_tokens)
+        student_local_cls_tokens_after_head = self.student.dino_head(student_local_cls_tokens)
+
+        # student local & teacher global dino loss
+        dino_local_crops_loss = self.dino_loss(
+            student_output_list=student_local_cls_tokens_after_head.chunk(n_local_crops),
+            teacher_out_softmaxed_centered_list=teacher_dino_softmaxed_centered_list,
+        ) / (n_global_crops_loss_terms + n_local_crops_loss_terms)
+        loss_dict['dino_local_crops_loss'] = dino_local_crops_loss * self.config.dino_loss_weight
+
+        # student global & teacher global dino loss
+        dino_global_crops_loss = self.dino_loss(
+            student_output_list=[student_global_cls_tokens_after_head],
+            teacher_out_softmaxed_centered_list=[teacher_dino_softmaxed_centered_list.flatten(0, 1)],
+        ) * 2 / (n_global_crops_loss_terms + n_local_crops_loss_terms)
+        loss_dict['dino_global_crops_loss'] = dino_global_crops_loss * self.config.dino_loss_weight
+
+        # koleo loss
+        koleo_loss = self.config.koleo_loss_weight * sum(
+            self.koleo_loss(p) for p in student_global_cls_tokens.chunk(2)
+        )
+        loss_dict['koleo_loss'] = koleo_loss
+
+        # ibot loss
+        ibot_patch_loss = self.ibot_patch_loss.forward_masked(
+            student_global_masked_patch_tokens_after_head,
+            masked_teacher_ibot_softmaxed_centered,
+            student_masks_flat=masks,
+            n_masked_patches=n_masked_patches,
+            masks_weight=masks_weight,
+        ) * 2 * ibot_loss_scale
+        loss_dict['ibot_patch_loss'] = ibot_patch_loss * self.config.ibot_loss_weight / 2
+
+        loss = 0
+        for key in loss_dict.keys():
+            loss += loss_dict[key]
+
+        return DINOv2ModelOutput(
+            loss=loss,
+            loss_dict=loss_dict,
+        )
+
+    @torch.no_grad()
+    def get_teacher_output(
+        self, 
+        global_crops, 
+        n_global_crops,
+        upperbound,
+        mask_indices_list,
+        n_masked_patches,
+        n_masked_patches_tensor,
+        teacher_temp,
+    ):
+        x, n_global_crops_teacher = global_crops, n_global_crops
+        teacher_backbone_output = self.teacher.backbone(x)
+        teacher_cls_tokens = teacher_backbone_output.x_norm_clstoken
+        teacher_cls_tokens = teacher_cls_tokens.chunk(n_global_crops_teacher)
+        teacher_cls_tokens = torch.cat((teacher_cls_tokens[1], teacher_cls_tokens[0]))
+        ibot_teacher_patch_tokens = teacher_backbone_output.x_norm_patchtokens
+        _dim = ibot_teacher_patch_tokens.shape[-1]
+        n_cls_tokens = teacher_cls_tokens.shape[0]
+
+        buffer_tensor_teacher = ibot_teacher_patch_tokens.new_zeros(upperbound, _dim)
+        torch.index_select(
+            ibot_teacher_patch_tokens.flatten(0, 1),
+            dim=0,
+            index=mask_indices_list,
+            out=buffer_tensor_teacher[:n_masked_patches],
+        )
+        teacher_cls_tokens_after_head = self.teacher.dino_head(teacher_cls_tokens)
+        masked_teacher_patch_tokens_after_head = self.teacher.ibot_head(buffer_tensor_teacher)
+        masked_teacher_patch_tokens_after_head = masked_teacher_patch_tokens_after_head[:n_masked_patches]
+
+        teacher_dino_softmaxed_centered_list = self.dino_loss.sinkhorn_knopp_teacher(
+            teacher_cls_tokens_after_head, teacher_temp=teacher_temp,
+        ).view(n_global_crops_teacher, -1, *teacher_cls_tokens_after_head.shape[1:])
+
+        masked_teacher_ibot_softmaxed_centered = self.ibot_patch_loss.sinkhorn_knopp_teacher(
+            masked_teacher_patch_tokens_after_head,
+            teacher_temp=teacher_temp,
+            n_masked_patches_tensor=n_masked_patches_tensor,
+        )
+        
         return teacher_dino_softmaxed_centered_list, masked_teacher_ibot_softmaxed_centered
 
     def get_params_groups(self):

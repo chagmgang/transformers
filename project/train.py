@@ -188,20 +188,20 @@ def main():
         num_heads=6,
         batch_size=4096,
         base_lr=0.002,
-        lr_warmup_percentile=float(10 / 100),
-        teacher_temp_warmup_percentile=float(30 / 100),
+        lr_warmup_percentile=float(3 / 25),
+        teacher_temp_warmup_percentile=float(8 / 25),
     )
     model = DINOv1(config)
 
     filenames = list()
     for filename in [
         '/nas/k8s/dev/mlops/chagmgang/msf24b/Million-AID.txt',
-        # '/nas/k8s/dev/mlops/chagmgang/msf24b/SkyScript_images2.txt',
-        # '/nas/k8s/dev/mlops/chagmgang/msf24b/SkyScript_images3.txt',
-        # '/nas/k8s/dev/mlops/chagmgang/msf24b/SkyScript_images4.txt',
-        # '/nas/k8s/dev/mlops/chagmgang/msf24b/SkyScript_images5.txt',
-        # '/nas/k8s/dev/mlops/chagmgang/msf24b/SkyScript_images6.txt',
-        # '/nas/k8s/dev/mlops/chagmgang/msf24b/SkyScript_images7.txt',
+        '/nas/k8s/dev/mlops/chagmgang/msf24b/SkyScript_images2.txt',
+        '/nas/k8s/dev/mlops/chagmgang/msf24b/SkyScript_images3.txt',
+        '/nas/k8s/dev/mlops/chagmgang/msf24b/SkyScript_images4.txt',
+        '/nas/k8s/dev/mlops/chagmgang/msf24b/SkyScript_images5.txt',
+        '/nas/k8s/dev/mlops/chagmgang/msf24b/SkyScript_images6.txt',
+        '/nas/k8s/dev/mlops/chagmgang/msf24b/SkyScript_images7.txt',
     ]:
         filenames.extend(read_filename(filename))
     
@@ -247,7 +247,7 @@ def main():
         save_strategy='epoch',
         report_to='tensorboard',
         do_train=True,
-        num_train_epochs=100,
+        num_train_epochs=25,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={
             'use_reentrant': False,

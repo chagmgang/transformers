@@ -35,6 +35,7 @@ class DINOv2Config(PretrainedConfig):
         student_temp=0.1,
         center_momentum=0.9,
         dino_loss_weight=1.0,
+        ibot_loss_weight=1.0,
         koleo_loss_weight=0.1,
         layerwise_decay=0.9,
         patch_embed_lr_mult=0.2,
@@ -81,6 +82,7 @@ class DINOv2Config(PretrainedConfig):
         self.student_temp = student_temp
         self.center_momentum = center_momentum
         self.dino_loss_weight = dino_loss_weight
+        self.ibot_loss_weight = ibot_loss_weight
         self.koleo_loss_weight = koleo_loss_weight
         self.layerwise_decay = layerwise_decay
         self.patch_embed_lr_mult = patch_embed_lr_mult
